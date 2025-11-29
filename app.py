@@ -1,0 +1,500 @@
+from flask import *
+from flask_mysqldb import MySQL   
+from MySQLdb.cursors import DictCursor                               
+import os     
+import mysql.connector
+
+app=Flask(__name__)
+
+# XAMPP MySQL Configuration
+app.config['MYSQL_HOST'] = 'localhost'
+app.config['MYSQL_USER'] = 'root'       # Default XAMPP username
+app.config['MYSQL_PASSWORD'] = ''       # Empty password by default
+app.config['MYSQL_DB'] = 'smartbank'    # Replace with your actual database name
+app.config['MYSQL_CURSORCLASS'] = 'DictCursor'
+
+mysql = MySQL(app)
+app.secret_key = 'abcde12345'  
+
+#------------------------------------------------ HOME PAGE----------------------------------
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+#------------------------------------------------ CUSTOMER DETAILS----------------------------------
+@app.route("/view_customer")
+def view_details():
+    if not session.get('loggedin') or session.get('role') != 'customer':
+        flash('Please login to access this page', 'warning')
+        return redirect(url_for('login'))
+    
+    cur = mysql.connection.cursor(cursorclass=DictCursor)
+    cur.execute('SELECT * FROM customers WHERE email = %s', (session['email'],))
+    user = cur.fetchone()
+    cur.close()
+    
+    return render_template("view_customer.html", user=user)
+
+
+#--------------------------------------------TRANSFER AMOUNT ----------------------------------
+@app.route("/trans_amount", methods=["GET", "POST"])
+def transfer_amount():
+    if not session.get('loggedin') or session.get('role') != 'customer':
+        flash('Please login to access this page', 'warning')
+        return redirect(url_for('login'))
+
+    if request.method == 'POST':
+        to_account = request.form.get('account_number')
+        amt = request.form.get('trans_amount')
+
+        # Basic validation
+        if not to_account or not amt:
+            flash('Please provide account number and amount', 'danger')
+            return render_template('transfer_amount.html')
+
+        try:
+            amount = float(amt)
+        except ValueError:
+            flash('Invalid amount provided', 'danger')
+            return render_template('transfer_amount.html')
+
+        if amount <= 0:
+            flash('Transfer amount must be greater than zero', 'danger')
+            return render_template('transfer_amount.html')
+
+        cur = mysql.connection.cursor(cursorclass=DictCursor)
+        try:
+            # Get sender account_number from customers table (using session email)
+            cur.execute('SELECT account_number FROM customers WHERE email = %s', (session['email'],))
+            cust = cur.fetchone()
+            if not cust:
+                flash('Sender account not found', 'danger')
+                return redirect(url_for('login'))
+
+            sender_account = cust['account_number']
+
+            # Fetch balances from accounts table
+            cur.execute('SELECT account_number, balance FROM accounts WHERE account_number = %s', (sender_account,))
+            sender_acc = cur.fetchone()
+
+            cur.execute('SELECT account_number, balance FROM accounts WHERE account_number = %s', (to_account,))
+            receiver_acc = cur.fetchone()
+
+            if not receiver_acc:
+                flash('Target account does not exist', 'danger')
+                return render_template('transfer_amount.html')
+
+            if not sender_acc:
+                flash('Sender account not found in accounts table', 'danger')
+                return render_template('transfer_amount.html')
+
+            if sender_acc['account_number'] == receiver_acc['account_number']:
+                flash('Cannot transfer to the same account', 'warning')
+                return render_template('transfer_amount.html')
+
+            # Check sufficient funds
+            if float(sender_acc['balance']) < amount:
+                flash('Insufficient funds', 'danger')
+                return render_template('transfer_amount.html')
+
+            # Perform transfer within a transaction
+            try:
+                # Debit sender
+                cur.execute('UPDATE accounts SET balance = balance - %s WHERE account_number = %s', (amount, sender_acc['account_number']))
+                # Credit receiver
+                cur.execute('UPDATE accounts SET balance = balance + %s WHERE account_number = %s', (amount, receiver_acc['account_number']))
+
+                # Record transaction (single record covers both sender and receiver)
+                cur.execute(
+                    'INSERT INTO transactions (from_account, to_account, amount) VALUES (%s, %s, %s)',
+                    (sender_acc['account_number'], receiver_acc['account_number'], amount)
+                )
+
+                mysql.connection.commit()
+                flash('Transfer completed successfully', 'success')
+                return redirect(url_for('transactions'))
+            except Exception:
+                mysql.connection.rollback()
+                flash('An error occurred during transfer', 'danger')
+                return render_template('transfer_amount.html')
+
+        finally:
+            cur.close()
+
+    # GET request: fetch and display sender's current balance
+    cur = mysql.connection.cursor(cursorclass=DictCursor)
+    try:
+        cur.execute('SELECT account_number FROM customers WHERE email = %s', (session['email'],))
+        cust = cur.fetchone()
+        balance = None
+        if cust:
+            cur.execute('SELECT balance FROM accounts WHERE account_number = %s', (cust['account_number'],))
+            acc = cur.fetchone()
+            if acc:
+                balance = acc['balance']
+        return render_template('transfer_amount.html', balance=balance)
+    except Exception:
+        return render_template('transfer_amount.html', balance=None)
+    finally:
+        cur.close()
+
+
+
+#--------------------------------------------TRANSACTIONS ----------------------------------
+@app.route("/transactions")
+def transactions():
+    if not session.get('loggedin') or session.get('role') != 'customer':
+        flash('Please login to access this page', 'warning')
+        return redirect(url_for('login'))
+
+    cur = mysql.connection.cursor(cursorclass=DictCursor)
+    try:
+        # Get the logged-in customer's account number
+        cur.execute('SELECT account_number FROM customers WHERE email = %s', (session['email'],))
+        cust = cur.fetchone()
+        if not cust:
+            flash('Customer not found', 'danger')
+            return redirect(url_for('login'))
+
+        acct = cust['account_number']
+
+        # Query transactions where this account was sender or receiver
+        # Assumes a `transactions` table with columns: id, from_account, to_account, amount, timestamp
+        cur.execute('''
+            SELECT id, from_account, to_account, amount, timestamp
+            FROM transactions
+            WHERE from_account = %s OR to_account = %s
+            ORDER BY timestamp DESC
+        ''', (acct, acct))
+        txns = cur.fetchall()
+
+        return render_template('transactions.html', transactions=txns)
+    except Exception:
+        flash('Could not load transactions', 'danger')
+        return render_template('transactions.html', transactions=[])
+    finally:
+        cur.close()
+
+
+# -------------------------------SAVINGS-----------------------------------------------------
+@app.route("/savings", methods=["GET", "POST"])
+def savings():
+    if not session.get('loggedin') or session.get('role') != 'customer':
+        flash('Please login to access this page', 'warning')
+        return redirect(url_for('login'))
+
+    if request.method == 'POST':
+        amt = request.form.get('savings_amount')
+        # Basic validation
+        if not amt:
+            flash('Please provide amount', 'danger')
+            return render_template('savings.html')
+        try:
+            amount = float(amt)
+        except ValueError:
+            flash('Invalid amount provided', 'danger')
+            return render_template('savings.html')
+        if amount <= 0:
+            flash('Amount must be greater than zero', 'danger')
+            return render_template('savings.html')
+
+        cur = mysql.connection.cursor(cursorclass=DictCursor)
+        try:
+            # Get customer's account_number from customers table (using session email)
+            cur.execute('SELECT account_number FROM customers WHERE email = %s', (session['email'],))
+            cust = cur.fetchone()
+            if not cust:
+                flash('Account not found', 'danger')
+                return redirect(url_for('login'))
+            account_number = cust['account_number']
+            
+            # Update balance in accounts table
+            cur.execute('UPDATE accounts SET balance = balance + %s WHERE account_number = %s', (amount, account_number))
+            
+            # Record savings transaction
+            cur.execute(
+                'INSERT INTO transactions (from_account, to_account, amount) VALUES (%s, %s, %s)',
+                (account_number, account_number, amount)
+            )
+            
+            mysql.connection.commit()
+            flash('Amount added to savings successfully', 'success')
+            
+        except Exception:
+            mysql.connection.rollback()
+            flash('An error occurred while saving', 'danger')
+            return render_template('savings.html')
+        finally:
+            cur.close()
+    
+    # GET request: fetch and display sender's current balance
+    cur = mysql.connection.cursor(cursorclass=DictCursor)
+    try:
+        cur.execute('SELECT account_number FROM customers WHERE email = %s', (session['email'],))
+        cust = cur.fetchone()
+        balance = None
+        if cust:
+            cur.execute('SELECT balance FROM accounts WHERE account_number = %s', (cust['account_number'],))
+            acc = cur.fetchone()
+            if acc:
+                balance = acc['balance']
+        return render_template('savings.html', balance=balance)
+    except Exception:
+        return render_template('savings.html', balance=None)
+    finally:
+        cur.close()
+
+#-----------------------------------------CUSTOMER DASHBOARD---------------------------------
+@app.route("/customer")
+def customer():
+    if not session.get('loggedin') or session.get('role') != 'customer':
+        flash('Please login to access this page', 'warning')
+        return redirect(url_for('login'))
+   
+    return render_template("customer.html")
+
+#---------------------------------------ADMIN DASHBOARD---------------------------------
+@app.route("/admin")
+def admin():
+    if not session.get('loggedin') or session.get('role') != 'admin':
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('login'))
+    
+    cur2=mysql.connection.cursor()
+    cur2.execute("SELECT * FROM customers")
+    data2=cur2.fetchall()
+    cur2.close()
+    return render_template('admin.html',user_data=data2)
+
+
+#-------------------------------------------REGISTERATION PAGE----------------------------------
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+     if (request.method == 'POST'):
+        # Get form data
+        account_number = request.form.get('account_number')
+        username = request.form.get('username')
+        dob = request.form.get('dob')
+        gender = request.form.get('gender')
+        aadhar_number = request.form.get('aadhar_number')
+        pan_number = request.form.get('pan_number')
+        phone_number = request.form.get('phone_number')
+        email = request.form.get('email')
+        password = request.form.get('password')
+        address = request.form.get('address')
+
+        # Validate required fields
+        if not all([account_number, username, dob,gender, aadhar_number, pan_number, phone_number, email, password, address]):
+            flash("All fields are required!", "danger")
+            return render_template('register.html')
+
+        cur1 = mysql.connection.cursor()
+        cur1.execute('SELECT email FROM customers WHERE email = %s OR account_number = %s', (email, account_number))
+        existing = cur1.fetchone()
+
+        if existing:
+            flash("An account with this email or account number already exists.", "danger")
+            return render_template('register.html')
+        
+        else:
+            cur1.execute(
+                    "INSERT INTO customers (account_number, username, dob, gender, aadhar_number, pan_number, phone_number, email, password, address) VALUES (%s, %s, %s, %s, %s, %s,%s, %s, %s, %s)",
+                    (account_number, username, dob, gender, aadhar_number, pan_number, phone_number, email, password, address)
+                )
+            cur1.execute(
+                    "INSERT INTO accounts (account_number, balance) VALUES (%s, %s)",
+                    (account_number, 0.0)
+                )
+            mysql.connection.commit()
+            cur1.close()
+            flash("Registration successful! Please login.", "success")
+            return redirect(url_for('login'))
+       
+     return render_template('register.html') 
+
+        
+ #-------------------------------------------LOGIN PAGE----------------------------------   
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        
+
+        # Check for admin login
+        if email == "admin@gmail.com" and password == "admin123":
+            session['loggedin'] = True
+            session['role'] = 'admin'
+            session['email'] = email
+            session['username'] = 'Admin'
+            flash('Welcome Admin!', 'success')
+            return redirect(url_for('admin'))
+    
+        # Check customer login
+        cur = mysql.connection.cursor(cursorclass=DictCursor)
+        cur.execute("SELECT * FROM customers WHERE email=%s AND password=%s", (email, password))
+        data = cur.fetchone()
+        cur.close()
+
+        if data:
+            session['loggedin'] = True
+            session['role'] = 'customer'
+            session['username'] = data['username']
+            session['email'] = data['email']
+            flash('Login successful!', 'success')
+            return redirect(url_for('customer'))
+        else:
+            flash("Invalid Email or Password", "danger")
+            return render_template('login.html')
+    
+    return render_template('login.html')
+
+
+#---------------------------------------FORGOT PASSWORD---------------------------------
+@app.route('/forgot_password', methods=['GET', 'POST'])
+def forgot_password():
+    if request.method == 'POST':
+        email = request.form.get('email')
+        new_password = request.form.get('new_password')
+        confirm_password = request.form.get('confirm_password')
+        
+        # Validate inputs
+        if not all([email, new_password, confirm_password]):
+            flash('Please fill in all fields', 'danger')
+            return render_template('forgot_password.html')
+            
+        if new_password != confirm_password:
+            flash('Passwords do not match', 'danger')
+            return render_template('forgot_password.html')
+            
+        # Check if email exists
+        cur = mysql.connection.cursor(cursorclass=DictCursor)
+        cur.execute('SELECT * FROM customers WHERE email = %s', (email,))
+        user = cur.fetchone()
+        
+        if not user:
+            flash('No account found with that email address', 'danger')
+            return render_template('forgot_password.html')
+            
+        try:
+            # Update password
+            cur.execute('UPDATE customers SET password = %s WHERE email = %s', 
+                       (new_password, email))
+            mysql.connection.commit()
+            flash('Password has been updated successfully! You can now login.', 'success')
+            return redirect(url_for('login'))
+            
+        except Exception as e:
+            flash('An error occurred while updating the password', 'danger')
+            return render_template('forgot_password.html')
+            
+        finally:
+            cur.close()
+            
+    return render_template('forgot_password.html')
+
+#---------------------------------------UPDATE ACCOUNT----------------------------------
+@app.route('/update_profile', methods=['GET', 'POST'])
+def update_profile():
+    if not session.get('loggedin'):
+        flash('Please login to update your profile', 'warning')
+        return redirect(url_for('login'))
+    
+    if request.method == 'GET':
+        cur = mysql.connection.cursor(cursorclass=DictCursor)
+        cur.execute('SELECT * FROM customers WHERE email = %s', (session['email'],))
+        user = cur.fetchone()
+        cur.close()
+        return render_template('update_profile.html', user=user)
+    
+    if request.method == 'POST':
+        username = request.form.get('username')
+        dob = request.form.get('dob')
+        phone_number = request.form.get('phone_number')
+        email = request.form.get('email')
+        
+        cur = mysql.connection.cursor()
+        try:
+            # Check if email exists for other users
+            if email != session['email']:
+                cur.execute('SELECT * FROM customers WHERE email = %s AND email != %s', 
+                          (email, session['email']))
+                if cur.fetchone():
+                    flash('Email already exists', 'danger')
+                    return redirect(url_for('update_profile'))
+            
+            # Update user information
+            cur.execute('''
+                UPDATE customers 
+                SET username = %s, dob = %s, phone_number = %s, email = %s 
+                WHERE email = %s
+            ''', (username, dob, phone_number, email, session['email']))
+            
+            mysql.connection.commit()
+            session['username'] = username
+            session['email'] = email
+            
+            flash('Profile updated successfully!', 'success')
+            return redirect(url_for('customer'))
+            
+        except Exception as e:
+            flash('An error occurred while updating your profile', 'danger')
+            return redirect(url_for('update_profile'))
+            
+        finally:
+            cur.close()
+
+
+#--------------------------------------DELETE ACCOUNT----------------------------------
+@app.route('/delete_account', methods=['GET', 'POST'])
+def delete_account():
+    if not session.get('loggedin'):
+        flash('Please login to delete your account', 'warning')
+        return redirect(url_for('login'))
+    
+    if request.method == 'POST':
+        password = request.form.get('password')
+        
+        # Verify password before deletion
+        cur = mysql.connection.cursor(cursorclass=DictCursor)
+        try:
+            cur.execute('SELECT * FROM customers WHERE email = %s AND password = %s', 
+                       (session['email'], password))
+            user = cur.fetchone()
+            
+            if not user:
+                flash('Invalid password. Account deletion failed.', 'danger')
+                return redirect(url_for('customer'))
+            
+            # Delete the account
+            cur.execute('DELETE FROM customers WHERE email = %s', (session['email'],))
+            cur.execute('DELETE FROM accounts WHERE account_number = %s', (user['account_number'],))
+            mysql.connection.commit()
+            
+            # Clear session and redirect to home
+            session.clear()
+            flash('Your account has been successfully deleted.', 'success')
+            return redirect(url_for('index'))
+            
+        except Exception as e:
+            flash('An error occurred while deleting your account.', 'danger')
+            return redirect(url_for('customer'))
+            
+        finally:
+            cur.close()
+    
+    return render_template('delete_account.html')
+
+
+#--------------------------------------LOGOUT----------------------------------
+@app.route('/logout')
+def logout():
+    # Clear all session data
+    session.clear()
+    flash('You have been logged out successfully', 'info')
+    return redirect(url_for('login'))
+
+
+if __name__=="__main__":
+    app.run(debug = True)
