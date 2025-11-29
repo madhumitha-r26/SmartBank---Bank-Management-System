@@ -1,4 +1,4 @@
-# HCL-Hackathon
+# SmartBank
 SmartBank - Modular Banking Backend System is a simple banking web application built with Flask and MySQL. This app allows customer registration, login, profile management, password reset, admin management, and basic money transfer simulation between accounts.
 
 # Features
