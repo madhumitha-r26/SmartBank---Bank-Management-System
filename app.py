@@ -304,7 +304,7 @@ def register():
                 )
             cur1.execute(
                     "INSERT INTO accounts (account_number, balance) VALUES (%s, %s)",
-                    (account_number, 0.0)
+                    (account_number, 0)
                 )
             mysql.connection.commit()
             cur1.close()
