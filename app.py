@@ -46,22 +46,23 @@ def transfer_amount():
 
     if request.method == 'POST':
         to_account = request.form.get('account_number')
-        amt = request.form.get('trans_amount')
+        amt = request.form.get('amount')
 
         # Basic validation
         if not to_account or not amt:
             flash('Please provide account number and amount', 'danger')
-            return render_template('transfer_amount.html')
+            return render_template('transfer_amount.html', balance=0)
 
         try:
             amount = float(amt)
+         
         except ValueError:
             flash('Invalid amount provided', 'danger')
-            return render_template('transfer_amount.html')
+            return render_template('transfer_amount.html', balance=0)
 
         if amount <= 0:
             flash('Transfer amount must be greater than zero', 'danger')
-            return render_template('transfer_amount.html')
+            return render_template('transfer_amount.html', balance=0)
 
         cur = mysql.connection.cursor(cursorclass=DictCursor)
         try:
@@ -73,30 +74,35 @@ def transfer_amount():
                 return redirect(url_for('login'))
 
             sender_account = cust['account_number']
-
+            
             # Fetch balances from accounts table
             cur.execute('SELECT account_number, balance FROM accounts WHERE account_number = %s', (sender_account,))
             sender_acc = cur.fetchone()
+            # determine current balance to pass back to template on errors
+            balance = 0
+
+            if sender_acc and sender_acc.get('balance') is not None:
+                balance = sender_acc['balance']
 
             cur.execute('SELECT account_number, balance FROM accounts WHERE account_number = %s', (to_account,))
             receiver_acc = cur.fetchone()
 
             if not receiver_acc:
                 flash('Target account does not exist', 'danger')
-                return render_template('transfer_amount.html')
+                return render_template('transfer_amount.html', balance=balance)
 
             if not sender_acc:
                 flash('Sender account not found in accounts table', 'danger')
-                return render_template('transfer_amount.html')
+                return render_template('transfer_amount.html', balance=0)
 
             if sender_acc['account_number'] == receiver_acc['account_number']:
                 flash('Cannot transfer to the same account', 'warning')
-                return render_template('transfer_amount.html')
+                return render_template('transfer_amount.html', balance=balance)
 
-            # Check sufficient funds
-            if float(sender_acc['balance']) < amount:
+            # Check sufficient funds (handle missing/NULL balance safely)
+            if sender_acc.get('balance') is None or float(sender_acc['balance']) < amount:
                 flash('Insufficient funds', 'danger')
-                return render_template('transfer_amount.html')
+                return render_template('transfer_amount.html', balance=balance)
 
             # Perform transfer within a transaction
             try:
@@ -117,7 +123,7 @@ def transfer_amount():
             except Exception:
                 mysql.connection.rollback()
                 flash('An error occurred during transfer', 'danger')
-                return render_template('transfer_amount.html')
+                return render_template('transfer_amount.html', balance=balance)
 
         finally:
             cur.close()
@@ -127,15 +133,23 @@ def transfer_amount():
     try:
         cur.execute('SELECT account_number FROM customers WHERE email = %s', (session['email'],))
         cust = cur.fetchone()
-        balance = None
-        if cust:
-            cur.execute('SELECT balance FROM accounts WHERE account_number = %s', (cust['account_number'],))
-            acc = cur.fetchone()
-            if acc:
-                balance = acc['balance']
+        if not cust:
+            # If customer not found, treat balance as zero
+            balance = 0
+            return render_template('transfer_amount.html', balance=balance)
+
+        cur.execute('SELECT balance FROM accounts WHERE account_number = %s', (cust['account_number'],))
+        acc = cur.fetchone()
+        if acc and acc.get('balance') is not None:
+            balance = acc['balance']
+        else:
+            # No account row -> treat balance as zero
+            balance = 0
+
         return render_template('transfer_amount.html', balance=balance)
-    except Exception:
-        return render_template('transfer_amount.html', balance=None)
+    except Exception as e:
+        print('transfer_amount GET error:', repr(e))
+        return render_template('transfer_amount.html', balance=0)
     finally:
         cur.close()
 
@@ -189,15 +203,15 @@ def savings():
         # Basic validation
         if not amt:
             flash('Please provide amount', 'danger')
-            return render_template('savings.html')
+            return render_template('savings.html', balance=0)
         try:
             amount = float(amt)
         except ValueError:
             flash('Invalid amount provided', 'danger')
-            return render_template('savings.html')
+            return render_template('savings.html', balance=0)
         if amount <= 0:
             flash('Amount must be greater than zero', 'danger')
-            return render_template('savings.html')
+            return render_template('savings.html', balance=0)
 
         cur = mysql.connection.cursor(cursorclass=DictCursor)
         try:
@@ -224,7 +238,7 @@ def savings():
         except Exception:
             mysql.connection.rollback()
             flash('An error occurred while saving', 'danger')
-            return render_template('savings.html')
+            return render_template('savings.html', balance=0)
         finally:
             cur.close()
     
@@ -233,15 +247,17 @@ def savings():
     try:
         cur.execute('SELECT account_number FROM customers WHERE email = %s', (session['email'],))
         cust = cur.fetchone()
-        balance = None
+        # default to zero; if account exists and has a balance use it
+        balance = 0
         if cust:
             cur.execute('SELECT balance FROM accounts WHERE account_number = %s', (cust['account_number'],))
             acc = cur.fetchone()
-            if acc:
+            if acc and acc.get('balance') is not None:
                 balance = acc['balance']
         return render_template('savings.html', balance=balance)
-    except Exception:
-        return render_template('savings.html', balance=None)
+    except Exception as e:
+        print('savings GET error:', repr(e))
+        return render_template('savings.html', balance=0)
     finally:
         cur.close()
 
@@ -255,8 +271,44 @@ def customer():
     return render_template("customer.html")
 
 #---------------------------------------ADMIN DASHBOARD---------------------------------
+
 @app.route("/admin")
 def admin():
+    if not session.get('loggedin') or session.get('role') != 'admin':
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('login'))
+   
+    # compute total revenue as sum of all account balances (treat NULL as 0)
+    cur = mysql.connection.cursor(cursorclass=DictCursor)
+    try:
+        cur.execute('SELECT COALESCE(SUM(balance), 0) AS total FROM accounts')
+        row = cur.fetchone()
+        total = row.get('total') if row else 0
+        # format with comma separators and 2 decimals for display
+        total_formatted = "{:, .2f}".replace(' ', '') if False else None
+        try:
+            # prefer numeric formatting with thousands separator
+            total_formatted = "{:, .2f}".replace(' ', '')
+        except Exception:
+            total_formatted = None
+        # fallback: if total is numeric, format normally
+        if total_formatted is None:
+            try:
+                total_revenue = "{:, .2f}".replace(' ', '')
+            except Exception:
+                total_revenue = total
+        # simpler: just format using Python's format
+        try:
+            total_revenue = format(float(total), ',.2f')
+        except Exception:
+            total_revenue = total
+        return render_template("admin.html", total_revenue=total_revenue)
+    finally:
+        cur.close()
+
+#---------------------------------------CUSTOMER DATABASE---------------------------------
+@app.route("/view_cus_db")
+def view_cus_db():
     if not session.get('loggedin') or session.get('role') != 'admin':
         flash('Unauthorized access', 'danger')
         return redirect(url_for('login'))
@@ -265,7 +317,7 @@ def admin():
     cur2.execute("SELECT * FROM customers")
     data2=cur2.fetchall()
     cur2.close()
-    return render_template('admin.html',user_data=data2)
+    return render_template('view_cus_db.html',user_data=data2)
 
 
 #-------------------------------------------REGISTERATION PAGE----------------------------------
@@ -328,7 +380,6 @@ def login():
             session['role'] = 'admin'
             session['email'] = email
             session['username'] = 'Admin'
-            flash('Welcome Admin!', 'success')
             return redirect(url_for('admin'))
     
         # Check customer login
@@ -342,7 +393,6 @@ def login():
             session['role'] = 'customer'
             session['username'] = data['username']
             session['email'] = data['email']
-            flash('Login successful!', 'success')
             return redirect(url_for('customer'))
         else:
             flash("Invalid Email or Password", "danger")
@@ -413,6 +463,7 @@ def update_profile():
         dob = request.form.get('dob')
         phone_number = request.form.get('phone_number')
         email = request.form.get('email')
+        address = request.form.get('address')
         
         cur = mysql.connection.cursor()
         try:
@@ -424,12 +475,13 @@ def update_profile():
                     flash('Email already exists', 'danger')
                     return redirect(url_for('update_profile'))
             
-            # Update user information
+            # Update profile details
             cur.execute('''
                 UPDATE customers 
-                SET username = %s, dob = %s, phone_number = %s, email = %s 
+                SET username = %s, dob = %s, phone_number = %s, email = %s, address = %s
                 WHERE email = %s
-            ''', (username, dob, phone_number, email, session['email']))
+            ''', (username, dob, phone_number, email, address, session['email']))
+    
             
             mysql.connection.commit()
             session['username'] = username
@@ -439,6 +491,8 @@ def update_profile():
             return redirect(url_for('customer'))
             
         except Exception as e:
+            # Print exception to console for debugging
+            print('Update profile error:', repr(e))
             flash('An error occurred while updating your profile', 'danger')
             return redirect(url_for('update_profile'))
             
@@ -470,6 +524,7 @@ def delete_account():
             # Delete the account
             cur.execute('DELETE FROM customers WHERE email = %s', (session['email'],))
             cur.execute('DELETE FROM accounts WHERE account_number = %s', (user['account_number'],))
+            cur.execute('DELETE FROM transactions WHERE from_account = %s OR to_account = %s', (user['account_number'], user['account_number']))
             mysql.connection.commit()
             
             # Clear session and redirect to home
