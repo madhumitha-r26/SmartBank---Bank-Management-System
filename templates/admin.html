@@ -77,8 +77,8 @@
               <img
                 src="{{ url_for('static', filename='users.png') }}"
                 alt="view__cus__db"
-                width="100"
-                height="100"
+                width="200"
+                height="200"
               />
               <p class="text-white text-center text-decoration-none fs-5">
                 View Customers Database
@@ -95,7 +95,10 @@
               data-bs-target="#staticBackdrop"
               style="background-color: rgb(96, 0, 72)"
             >
-             <img src="{{ url_for('static', filename='revenue.png') }}" alt="revenue" width="100" height="100"/>
+             <img src="{{ url_for('static', filename='revenue.png') }}" 
+             alt="revenue"                 
+             width="200"
+             height="200"/>
               <p class="text-white text-center text-decoration-none fs-5">Total Revenue</p>
         </button>
         
@@ -115,11 +118,23 @@
     </div>
   </div>
 </div>
-
-
       </div>
         
-      
+             <div class="col">
+              <a
+            href="{{ url_for('cus_trans_his') }}"
+            class="text-decoration-none"
+          >
+          <div class="adm_btn view_trans" style="background-color: rgb(33, 199, 0);">
+            <img src="{{ url_for('static', filename='transaction.png') }}" 
+            alt="view_trans"                 
+            width="200"
+            height="200"/>
+             <p class="text-white fs-5 text-center text-decoration-none">Transaction History</p>
+          </div>
+          </a>
+        </div>
+
     </div>
 
     <script

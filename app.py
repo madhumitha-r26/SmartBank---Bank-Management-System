@@ -3,6 +3,10 @@ from flask_mysqldb import MySQL
 from MySQLdb.cursors import DictCursor                               
 import os     
 import mysql.connector
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from datetime import datetime
+from io import BytesIO
 
 app=Flask(__name__)
 
@@ -314,10 +318,167 @@ def view_cus_db():
         return redirect(url_for('login'))
     
     cur2=mysql.connection.cursor()
-    cur2.execute("SELECT * FROM customers")
+    cur2.execute("SELECT * FROM customers ORDER BY account_number ASC")
     data2=cur2.fetchall()
     cur2.close()
     return render_template('view_cus_db.html',user_data=data2)
+
+
+#---------------------------------------EXPORT CUSTOMERS TO EXCEL---------------------------------
+@app.route("/export_customers")
+def export_customers():
+    if not session.get('loggedin') or session.get('role') != 'admin':
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('login'))
+    
+    try:
+        # Fetch all customer data
+        cur = mysql.connection.cursor(cursorclass=DictCursor)
+        cur.execute("SELECT * FROM customers ORDER BY account_number ASC")
+        customers = cur.fetchall()
+        cur.close()
+        
+        # Create a new workbook and select active sheet
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Customers"
+        
+        # Add headers
+        headers = ['Account Number', 'Username', 'DOB', 'Gender', 'Aadhar', 'PAN', 'Phone', 'Email', 'Address']
+        ws.append(headers)
+        
+        # Style header row
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+        
+        # Add data rows
+        for customer in customers:
+            row = [
+                customer.get('account_number', ''),
+                customer.get('username', ''),
+                customer.get('dob', ''),
+                customer.get('gender', ''),
+                customer.get('aadhar_number', ''),
+                customer.get('pan_number', ''),
+                customer.get('phone_number', ''),
+                customer.get('email', ''),
+                customer.get('address', '')
+            ]
+            ws.append(row)
+        
+        # Adjust column widths
+        column_widths = [18, 15, 12, 10, 15, 12, 12, 20, 25]
+        for i, width in enumerate(column_widths, 1):
+            ws.column_dimensions[chr(64 + i)].width = width
+        
+        # Save to BytesIO object
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        # Generate filename with current date
+        filename = f"customers_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        
+        # Return file as download
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=filename
+        )
+    
+    except Exception as e:
+        print('Export error:', repr(e))
+        flash('An error occurred while exporting data', 'danger')
+        return redirect(url_for('view_cus_db'))
+
+
+#-------------------------------------------EXPORT TRANSACTIONS----------------------------------
+@app.route("/export_transactions")
+def export_transactions():
+    if not session.get('loggedin'):
+        flash('Please login to access this page', 'warning')
+        return redirect(url_for('login'))
+
+    try:
+        cur = mysql.connection.cursor(cursorclass=DictCursor)
+
+        # If admin, export ALL transactions; if customer, export only theirs
+        if session.get('role') == 'admin':
+            cur.execute('SELECT id, from_account, to_account, amount, timestamp FROM transactions ORDER BY timestamp DESC')
+            trans = cur.fetchall()
+        else:
+            # customer
+            cur.execute('SELECT account_number FROM customers WHERE email = %s', (session.get('email'),))
+            customer = cur.fetchone()
+            if not customer:
+                flash('Customer account not found', 'danger')
+                cur.close()
+                return redirect(url_for('transactions'))
+
+            account_number = customer['account_number']
+            cur.execute('''
+                SELECT id, from_account, to_account, amount, timestamp
+                FROM transactions
+                WHERE from_account = %s OR to_account = %s
+                ORDER BY timestamp DESC
+            ''', (account_number, account_number))
+            trans = cur.fetchall()
+
+        cur.close()
+
+        # Build workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Transactions"
+
+        headers = ['Date/Time', 'From Account', 'To Account', 'Amount']
+        ws.append(headers)
+
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+
+        for transaction in trans:
+            # Ensure timestamp is string for Excel representation
+            ts = transaction.get('timestamp')
+            if hasattr(ts, 'strftime'):
+                ts = ts.strftime('%Y-%m-%d %H:%M:%S')
+
+            row = [
+                ts,
+                transaction.get('from_account', ''),
+                transaction.get('to_account', ''),
+                transaction.get('amount', '')
+            ]
+            ws.append(row)
+
+        column_widths = [25, 20, 20, 15]
+        for i, width in enumerate(column_widths, 1):
+            ws.column_dimensions[chr(64 + i)].width = width
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        filename = f"transactions_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=filename
+        )
+
+    except Exception as e:
+        print('Export transactions error:', repr(e))
+        flash('An error occurred while exporting transactions', 'danger')
+        return redirect(url_for('transactions'))
 
 
 #-------------------------------------------REGISTERATION PAGE----------------------------------
@@ -443,6 +604,20 @@ def forgot_password():
             cur.close()
             
     return render_template('forgot_password.html')
+
+
+#------------------------------VIEW CUSTOMER TRANSACTIONS----------------------------------
+@app.route('/cus_trans_his')
+def cus_trans_his():
+    if not session.get('loggedin') or session.get('role') != 'admin':
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('login'))
+    
+    cur3=mysql.connection.cursor()
+    cur3.execute("SELECT * FROM transactions")
+    trans_his=cur3.fetchall()
+    cur3.close()
+    return render_template('cus_trans_his.html',trans=trans_his)
 
 #---------------------------------------UPDATE ACCOUNT----------------------------------
 @app.route('/update_profile', methods=['GET', 'POST'])
